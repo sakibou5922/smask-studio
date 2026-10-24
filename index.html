@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>SMASK</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; font-family: system-ui, -apple-system, "Hiragino Sans", "Yu Gothic UI", sans-serif; color: #fff;
+    background: radial-gradient(1.5px 1.5px at 20px 30px, #fff 50%, transparent 51%) 0 0 / 220px 220px, radial-gradient(1px 1px at 120px 160px, #ffe98a 50%, transparent 51%) 0 0 / 260px 260px, radial-gradient(ellipse 70% 60% at 30% 25%, #3b2a8f 0%, #1c1857 55%, #0c0a2b 100%); }
+  .card { width: min(380px, 100%); padding: 32px 26px 26px; background: #15122f; border: 3px solid #fff; border-radius: 20px; box-shadow: 10px 12px 0 #ff4fa3; }
+  h1 { margin: 0 0 6px; font-size: 34px; font-weight: 900; letter-spacing: -0.02em; }
+  p { margin: 0 0 18px; font-size: 14px; line-height: 1.7; color: #d6d3ff; }
+  label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 700; }
+  input[type=password] { width: 100%; min-height: 48px; padding: 10px 14px; border: 2px solid #fff; border-radius: 12px; background: #0c0a2b; color: #fff; font-size: 16px; }
+  .remember { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; font-size: 13px; }
+  button { width: 100%; min-height: 50px; border: 3px solid #111; border-radius: 999px; background: #ffd400; color: #111; font-size: 16px; font-weight: 900; cursor: pointer; box-shadow: 0 4px 0 #111; }
+  button:disabled { opacity: 0.6; cursor: default; }
+  :focus-visible { outline: 3px solid #36aae5; outline-offset: 3px; }
+  #msg { min-height: 1.6em; margin: 14px 0 0; font-size: 13px; }
+  #msg.err { color: #ff8ab8; font-weight: 700; }
+  .note { margin: 18px 0 0; font-size: 11px; color: #9a96d0; }
+  .note a { color: inherit; }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>SMASK</h1>
+  <p>このサイトはパスワードで保護されています。</p>
+  <form id="lockForm">
+    <label for="lockPw">パスワード</label>
+    <input id="lockPw" type="password" autocomplete="current-password" required>
+    <label class="remember"><input id="lockRemember" type="checkbox" checked> この端末で覚えておく</label>
+    <button id="lockBtn" type="submit">ひらく</button>
+    <p id="msg" role="status" aria-live="polite"></p>
+  </form>
+  <p class="note">共用の端末では「覚えておく」を外してください。記憶を消すときは <a href="?logout">こちら</a>。</p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const KDF = {"salt":"QQ93UWgDFAhISx/Yvu0lDQ==","iterations":600000};
+  const VERSION = "85d742fdffec8a44";
+  const PREFIX = "smask-site-";
+  const CACHE = PREFIX + VERSION;
+  const FLAG = "smask-site-session";
+  const $ = (id) => document.getElementById(id);
+  const msg = (text, isErr) => { $("msg").textContent = text; $("msg").className = isErr ? "err" : ""; };
+  const b64ToBytes = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  const base = new URL(".", location.href);
+  class WrongPassword extends Error {}
+
+  const clearAll = async () => { for (const k of await caches.keys()) if (k.startsWith(PREFIX)) await caches.delete(k); };
+  let vaultPromise = null;
+  const loadVault = () => {
+    if (!vaultPromise) {
+      vaultPromise = fetch(new URL("vault.json", base), { cache: "no-cache" }).then((r) => { if (!r.ok) throw new Error("vault " + r.status); return r.json(); });
+      vaultPromise.catch(() => { vaultPromise = null; });
+    }
+    return vaultPromise;
+  };
+
+  async function deriveKey(password) {
+    const raw = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: b64ToBytes(KDF.salt), iterations: KDF.iterations }, raw, 256);
+    return crypto.subtle.importKey("raw", bits, { name: "AES-GCM" }, false, ["decrypt"]);
+  }
+
+  async function unlock(password) {
+    const vault = await loadVault();
+    if (!vault || vault.format !== "smask-site" || vault.id !== VERSION) throw new Error("shape");
+    let plain;
+    try {
+      plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(vault.iv) }, await deriveKey(password), b64ToBytes(vault.ct));
+    } catch {
+      throw new WrongPassword();
+    }
+    const text = await new Response(new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+    const files = JSON.parse(text);
+    await clearAll();
+    const cache = await caches.open(CACHE);
+    await Promise.all(Object.entries(files).map(([p, f]) =>
+      cache.put(new URL("app/" + p, base).href, new Response(b64ToBytes(f.data), { headers: { "content-type": f.type } }))));
+  }
+
+  const setFlag = (keep) => {
+    try {
+      if (keep) localStorage.setItem(FLAG, "keep");
+      else { localStorage.removeItem(FLAG); sessionStorage.setItem(FLAG, "open"); }
+    } catch { /* storage blocked */ }
+  };
+  const hasFlag = () => {
+    try { return localStorage.getItem(FLAG) === "keep" || sessionStorage.getItem(FLAG) === "open"; } catch { return false; }
+  };
+  const clearFlag = () => {
+    try { localStorage.removeItem(FLAG); sessionStorage.removeItem(FLAG); } catch { /* storage blocked */ }
+  };
+
+  async function start() {
+    if (!("serviceWorker" in navigator) || !window.caches || !window.crypto || !crypto.subtle || typeof DecompressionStream === "undefined") {
+      msg("このブラウザーでは開けません。新しい Chrome・Edge・Safari で開いてください。", true);
+      $("lockBtn").disabled = true;
+      return;
+    }
+    const ready = navigator.serviceWorker.register(new URL("sw.js", base)).then(() => navigator.serviceWorker.ready);
+    const params = new URLSearchParams(location.search);
+    // this password screen may be an old copy kept by the browser: if a newer version is published, load the new screen
+    try {
+      const r = await fetch(new URL("version.json", base), { cache: "no-store" });
+      const latest = r.ok ? (await r.json()).id : null;
+      if (latest && latest !== VERSION && params.get("v") !== latest) {
+        location.replace(base.pathname + "?v=" + latest + (params.has("logout") ? "&logout" : ""));
+        return;
+      }
+    } catch { /* offline: carry on with this copy */ }
+    if (params.has("logout")) {
+      await clearAll();
+      clearFlag();
+      history.replaceState(null, "", base.pathname);
+      msg("この端末の記憶を消しました。");
+    } else if ((await caches.has(CACHE)) && hasFlag()) {
+      msg("ひらいています…");
+      await ready;
+      location.replace(new URL("app/", base).href);
+      return;
+    } else {
+      await clearAll();
+    }
+    loadVault().catch(() => {});
+    if (matchMedia("(hover: hover)").matches) $("lockPw").focus();
+    $("lockForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const password = $("lockPw").value;
+      if (!password) return;
+      $("lockBtn").disabled = true;
+      msg("確かめています…");
+      try {
+        await unlock(password);
+        setFlag($("lockRemember").checked);
+        $("lockPw").value = "";
+        msg("ひらいています…");
+        await ready;
+        location.href = new URL("app/", base).href;
+      } catch (err) {
+        msg(err instanceof WrongPassword ? "パスワードが違います。" : "読み込めませんでした。インターネットにつながっているか確かめて、再読み込みしてください。", true);
+        $("lockBtn").disabled = false;
+        $("lockPw").select();
+      }
+    });
+  }
+  start();
+})();
+</script>
+</body>
+</html>
